@@ -1,22 +1,43 @@
 using SleepHealing.EEG;
 using UnityEngine;
+using UnityEngine.Rendering;
+using UnityEngine.Rendering.Universal;
 
 namespace SleepHealing.Core
 {
+    /// <summary>
+    /// 星空疗愈舱视觉：程序化 HDR 星穹、镜面舱台、发光穹顶光弧、呼吸光核与近景星尘，全部运行时生成。
+    /// 依赖 URP 后处理（Bloom / ACES）把 HDR 发光变成柔和辉光。
+    /// </summary>
     public sealed class HealingEnvironment : MonoBehaviour
     {
+        private static readonly Color CoolGuide = new Color(0.30f, 0.48f, 0.95f);
+        private static readonly Color WarmGold = new Color(1.00f, 0.66f, 0.30f);
+        private static readonly Vector3 DomeCenter = new Vector3(0f, -1.3f, 2.0f);
+        private const float DomeRadius = 3.4f;
+        private const float ProbeRefreshSeconds = 2.5f;
+        private const int GlowLayer = 1; // TransparentFX：光晕与星尘不进反射探针
+
         private Camera viewingCamera;
-        private Light ambientKey;
+        private Light orbLight;
         private Transform breathingOrb;
+        private Transform halo;
         private Transform starField;
         private ParticleSystem stars;
-        private Material orbMaterial;
+        private ReflectionProbe reflectionProbe;
+        private Material orbCoreMaterial;
+        private Material haloMaterial;
+        private Material lineMaterial;
+        private Material starMaterial;
+        private Material skyMaterial;
         private AudioSource ambientAudio;
         private float targetIntensity = 0.35f;
         private float currentIntensity = 0.35f;
         private float targetMotion = 0.05f;
         private float currentMotion = 0.05f;
         private float targetAudio = 0.025f;
+        private float skyRotation;
+        private float probeTimer;
         private bool initialized;
         private bool safeState;
 
@@ -32,18 +53,17 @@ namespace SleepHealing.Core
             }
 
             initialized = true;
-            RenderSettings.fog = true;
-            RenderSettings.fogMode = FogMode.ExponentialSquared;
-            RenderSettings.fogDensity = 0.008f;
-            RenderSettings.fogColor = new Color(0.012f, 0.018f, 0.055f);
-            RenderSettings.ambientMode = UnityEngine.Rendering.AmbientMode.Flat;
-            RenderSettings.ambientLight = new Color(0.018f, 0.025f, 0.07f);
-
             CreateCamera();
-            CreateCabin();
-            CreateStarField();
+            CreateSky();
+            CreateLighting();
+            CreatePostProcessing();
+            CreatePlatform();
+            CreateDome();
+            CreateStarDust();
             CreateBreathingOrb();
+            CreateReflectionProbe();
             CreateAmbientSound();
+            ApplyVisuals(0f);
         }
 
         public void Apply(ExperienceStage stage, EEGState state, bool adaptive, float deltaSeconds)
@@ -64,33 +84,16 @@ namespace SleepHealing.Core
             targetMotion = Mathf.Lerp(0.025f, 0.12f, 1f - relaxation);
             targetAudio = Mathf.Lerp(0.018f, 0.065f, targetIntensity);
 
-            var response = 1f - Mathf.Exp(-Mathf.Max(0f, deltaSeconds) * 0.7f);
+            var delta = Mathf.Max(0f, deltaSeconds);
+            var response = 1f - Mathf.Exp(-delta * 0.7f);
             currentIntensity = Mathf.Lerp(currentIntensity, targetIntensity, response);
             currentMotion = Mathf.Lerp(currentMotion, targetMotion, response);
             ambientAudio.volume = Mathf.Lerp(ambientAudio.volume, targetAudio, response);
             ambientAudio.pitch = Mathf.Lerp(0.92f, 1.02f, relaxation);
 
-            var midnight = new Color(0.035f, 0.075f, 0.19f);
-            var warmGold = new Color(0.95f, 0.60f, 0.22f);
-            var glow = Color.Lerp(midnight, warmGold, currentIntensity * 0.72f);
-            ambientKey.color = glow;
-            ambientKey.intensity = Mathf.Lerp(0.35f, 1.25f, currentIntensity);
-            orbMaterial.SetColor("_Color", glow);
-            if (orbMaterial.HasProperty("_EmissionColor"))
-            {
-                orbMaterial.EnableKeyword("_EMISSION");
-                orbMaterial.SetColor("_EmissionColor", glow * Mathf.Lerp(0.8f, 2.4f, currentIntensity));
-            }
-
-            var starMain = stars.main;
-            starMain.startColor = Color.Lerp(new Color(0.38f, 0.48f, 0.82f, 0.55f), new Color(1f, 0.78f, 0.38f, 0.95f), currentIntensity);
-            starMain.startSize = Mathf.Lerp(0.16f, 0.42f, currentIntensity);
-            var emission = stars.emission;
-            emission.rateOverTime = Mathf.Lerp(8f, 26f, currentIntensity);
-
-            var breath = 1f + Mathf.Sin(Time.unscaledTime * Mathf.PI / 3f) * 0.055f;
-            breathingOrb.localScale = Vector3.one * breath;
-            starField.Rotate(Vector3.up, currentMotion * Mathf.Max(0f, deltaSeconds), Space.World);
+            skyRotation = (skyRotation + currentMotion * delta) % 360f;
+            starField.Rotate(Vector3.up, currentMotion * delta, Space.World);
+            ApplyVisuals(delta);
         }
 
         public void EnterSafeState()
@@ -109,9 +112,9 @@ namespace SleepHealing.Core
             {
                 stars.Pause(true);
             }
-            if (breathingOrb != null)
+            if (initialized)
             {
-                breathingOrb.localScale = Vector3.one;
+                ApplyVisuals(0f);
             }
         }
 
@@ -120,6 +123,45 @@ namespace SleepHealing.Core
             safeState = false;
             if (stars != null && !stars.isPlaying) stars.Play(true);
             if (ambientAudio != null && !ambientAudio.isPlaying) ambientAudio.Play();
+        }
+
+        private void ApplyVisuals(float delta)
+        {
+            var intensity = currentIntensity;
+            var glow = Color.Lerp(CoolGuide, WarmGold, intensity * 0.85f);
+            var breath = safeState ? 1f : 1f + Mathf.Sin(Time.unscaledTime * Mathf.PI / 3f) * 0.05f;
+
+            orbCoreMaterial.SetColor("_EmissionColor", glow * Mathf.Lerp(0.9f, 2.4f, intensity));
+            var haloTint = glow * Mathf.Lerp(1.0f, 1.6f, intensity);
+            haloTint.a = Mathf.Lerp(0.15f, 0.45f, intensity);
+            haloMaterial.SetColor("_BaseColor", haloTint);
+            orbLight.color = glow;
+            orbLight.intensity = Mathf.Lerp(0.4f, 2.0f, intensity);
+            breathingOrb.localScale = Vector3.one * (0.6f * breath);
+            halo.localScale = Vector3.one * (2.0f * breath);
+            halo.rotation = Quaternion.LookRotation(halo.position - viewingCamera.transform.position);
+
+            var lineTint = glow * Mathf.Lerp(1.0f, 2.2f, intensity);
+            lineTint.a = 1f;
+            lineMaterial.SetColor("_BaseColor", lineTint);
+
+            var starTint = Color.Lerp(new Color(0.55f, 0.70f, 1f), new Color(1f, 0.85f, 0.60f), intensity) * Mathf.Lerp(0.9f, 1.8f, intensity);
+            starTint.a = 1f;
+            starMaterial.SetColor("_BaseColor", starTint);
+            var emission = stars.emission;
+            emission.rateOverTime = Mathf.Lerp(3f, 10f, intensity);
+            var main = stars.main;
+            main.startSize = new ParticleSystem.MinMaxCurve(Mathf.Lerp(0.008f, 0.014f, intensity), Mathf.Lerp(0.02f, 0.035f, intensity));
+
+            skyMaterial.SetFloat("_Exposure", Mathf.Lerp(0.7f, 1.15f, intensity));
+            skyMaterial.SetFloat("_Rotation", skyRotation);
+
+            probeTimer -= delta;
+            if (probeTimer <= 0f)
+            {
+                probeTimer = ProbeRefreshSeconds;
+                reflectionProbe.RenderProbe();
+            }
         }
 
         private void CreateCamera()
@@ -143,78 +185,216 @@ namespace SleepHealing.Core
             viewingCamera.fieldOfView = 72f;
             viewingCamera.nearClipPlane = 0.05f;
             viewingCamera.farClipPlane = 120f;
-            viewingCamera.clearFlags = CameraClearFlags.SolidColor;
-            viewingCamera.backgroundColor = new Color(0.004f, 0.006f, 0.025f);
+            viewingCamera.clearFlags = CameraClearFlags.Skybox;
             viewingCamera.allowHDR = true;
+            viewingCamera.allowMSAA = true;
+
+            var cameraData = viewingCamera.GetUniversalAdditionalCameraData();
+            cameraData.renderPostProcessing = true;
+            cameraData.antialiasing = AntialiasingMode.None;
+            cameraData.dithering = true;
+            cameraData.renderShadows = false;
         }
 
-        private void CreateCabin()
+        private void CreateSky()
         {
-            var shell = new GameObject("疗愈仓结构");
-            shell.transform.SetParent(transform, false);
-            var shellMaterial = CreateMaterial("仓体深靛", new Color(0.025f, 0.035f, 0.085f), 0.42f, 0.78f);
-            var trimMaterial = CreateMaterial("暖金导光", new Color(0.42f, 0.24f, 0.075f), 0.65f, 0.55f);
+            skyMaterial = InstantiateTemplate("Skybox", "Skybox/Cubemap");
+            skyMaterial.SetTexture("_Tex", StarSky.CreateCubemap(512, 20260906));
+            skyMaterial.SetFloat("_Exposure", 1f);
+            RenderSettings.skybox = skyMaterial;
+            RenderSettings.fog = false;
+            RenderSettings.ambientMode = AmbientMode.Skybox;
+            RenderSettings.ambientIntensity = 1.5f;
+            RenderSettings.defaultReflectionMode = DefaultReflectionMode.Skybox;
+            RenderSettings.defaultReflectionResolution = 128;
+            RenderSettings.reflectionIntensity = 1f;
+            DynamicGI.UpdateEnvironment();
+        }
 
-            var floor = CreatePrimitive(PrimitiveType.Cylinder, "悬浮舱台", shell.transform, shellMaterial);
-            floor.transform.position = new Vector3(0f, -1.35f, 3.8f);
-            floor.transform.localScale = new Vector3(3.7f, 0.12f, 5.3f);
+        private void CreateLighting()
+        {
+            var moon = new GameObject("月光").AddComponent<Light>();
+            moon.transform.SetParent(transform, false);
+            moon.transform.rotation = Quaternion.Euler(52f, 205f, 0f);
+            moon.type = LightType.Directional;
+            moon.color = new Color(0.55f, 0.66f, 1f);
+            moon.intensity = 0.2f;
+            moon.shadows = LightShadows.None;
+        }
 
-            for (var index = 0; index < 14; index++)
+        private void CreatePostProcessing()
+        {
+            var volumeObject = new GameObject("画面后处理");
+            volumeObject.transform.SetParent(transform, false);
+            var volume = volumeObject.AddComponent<Volume>();
+            volume.isGlobal = true;
+            volume.priority = 1f;
+            var profile = ScriptableObject.CreateInstance<VolumeProfile>();
+            profile.name = "星空深睡画面";
+            volume.sharedProfile = profile;
+
+            var bloom = profile.Add<Bloom>(true);
+            bloom.threshold.value = 1.2f;
+            bloom.intensity.value = 0.55f;
+            bloom.scatter.value = 0.6f;
+            bloom.maxIterations.value = 5;
+            bloom.highQualityFiltering.value = false;
+
+            var tonemapping = profile.Add<Tonemapping>(true);
+            tonemapping.mode.value = TonemappingMode.ACES;
+
+            var color = profile.Add<ColorAdjustments>(true);
+            color.postExposure.value = 0f;
+            color.contrast.value = 10f;
+            color.saturation.value = 12f;
+
+            var vignette = profile.Add<Vignette>(true);
+            vignette.intensity.value = 0.25f;
+            vignette.smoothness.value = 0.5f;
+        }
+
+        private void CreatePlatform()
+        {
+            var platformMaterial = CreateLit("镜面舱台材质", new Color(0.05f, 0.06f, 0.10f), 0.35f, 0.9f);
+            var platform = CreatePrimitive(PrimitiveType.Cylinder, "镜面舱台", transform, platformMaterial);
+            platform.transform.position = DomeCenter + Vector3.down * 0.02f;
+            platform.transform.localScale = new Vector3(DomeRadius * 2f + 0.1f, 0.02f, DomeRadius * 2f + 0.1f);
+
+            lineMaterial = InstantiateTemplate("Additive", "Universal Render Pipeline/Particles/Unlit");
+            lineMaterial.name = "线光材质";
+
+            const int segments = 96;
+            var ring = new Vector3[segments];
+            for (var index = 0; index < segments; index++)
             {
-                var angle = Mathf.Lerp(-68f, 68f, index / 13f) * Mathf.Deg2Rad;
-                var rib = CreatePrimitive(PrimitiveType.Cube, $"舱壁导光-{index + 1:00}", shell.transform, index % 3 == 0 ? trimMaterial : shellMaterial);
-                rib.transform.position = new Vector3(Mathf.Sin(angle) * 4.2f, 1.1f + Mathf.Cos(angle) * 2.7f, 4.7f);
-                rib.transform.localScale = new Vector3(0.055f, 5.4f, 0.12f);
-                rib.transform.rotation = Quaternion.Euler(0f, 0f, -angle * Mathf.Rad2Deg);
+                var angle = index / (float)segments * Mathf.PI * 2f;
+                ring[index] = DomeCenter + new Vector3(Mathf.Sin(angle) * (DomeRadius + 0.02f), 0.015f, Mathf.Cos(angle) * (DomeRadius + 0.02f));
             }
+            var ringGradient = MakeGradient(
+                new[] { (0f, new Color(1f, 0.86f, 0.62f)), (1f, new Color(1f, 0.86f, 0.62f)) },
+                new[] { (0f, 0.8f), (1f, 0.8f) });
+            CreateLine("舱台光环", ring, true, 0.02f, 0.02f, ringGradient);
+        }
 
-            for (var index = 0; index < 7; index++)
+        private void CreateDome()
+        {
+            var arcGradient = MakeGradient(
+                new[] { (0f, new Color(1f, 0.92f, 0.80f)), (0.5f, new Color(0.92f, 0.94f, 1f)), (1f, new Color(0.85f, 0.90f, 1f)) },
+                new[] { (0f, 0f), (0.12f, 0.85f), (0.55f, 0.45f), (1f, 0f) });
+
+            const int arcs = 12;
+            const int points = 36;
+            for (var index = 0; index < arcs; index++)
             {
-                var rail = CreatePrimitive(PrimitiveType.Cube, $"纵向星轨-{index + 1:00}", shell.transform, trimMaterial);
-                rail.transform.position = new Vector3(Mathf.Lerp(-3.1f, 3.1f, index / 6f), 2.9f, 6.8f);
-                rail.transform.localScale = new Vector3(0.025f, 0.025f, 5.5f);
+                var azimuth = (index + 0.5f) * (360f / arcs) * Mathf.Deg2Rad;
+                var arc = new Vector3[points];
+                for (var point = 0; point < points; point++)
+                {
+                    var elevation = Mathf.Lerp(1f, 80f, point / (float)(points - 1)) * Mathf.Deg2Rad;
+                    arc[point] = DomeCenter + new Vector3(
+                        Mathf.Cos(elevation) * Mathf.Sin(azimuth),
+                        Mathf.Sin(elevation),
+                        Mathf.Cos(elevation) * Mathf.Cos(azimuth)) * DomeRadius;
+                }
+                CreateLine($"穹顶光弧-{index + 1:00}", arc, false, 0.03f, 0.01f, arcGradient);
             }
         }
 
-        private void CreateStarField()
+        private void CreateStarDust()
         {
-            starField = new GameObject("星穹").transform;
+            starField = new GameObject("星尘").transform;
             starField.SetParent(transform, false);
+            starField.position = DomeCenter + Vector3.up * 1.4f;
+            starField.gameObject.layer = GlowLayer;
             stars = starField.gameObject.AddComponent<ParticleSystem>();
+            stars.Stop(true, ParticleSystemStopBehavior.StopEmittingAndClear);
+
             var main = stars.main;
             main.loop = true;
-            main.duration = 20f;
-            main.startLifetime = 80f;
-            main.startSpeed = 0.012f;
-            main.startSize = 0.28f;
-            main.maxParticles = 1800;
+            main.duration = 30f;
+            main.startLifetime = new ParticleSystem.MinMaxCurve(18f, 40f);
+            main.startSpeed = new ParticleSystem.MinMaxCurve(0.01f, 0.04f);
+            main.startSize = new ParticleSystem.MinMaxCurve(0.012f, 0.04f);
+            main.startColor = Color.white;
+            main.maxParticles = 300;
             main.simulationSpace = ParticleSystemSimulationSpace.Local;
             main.gravityModifier = 0f;
 
+            var emission = stars.emission;
+            emission.rateOverTime = 6f;
+
             var shape = stars.shape;
             shape.shapeType = ParticleSystemShapeType.Sphere;
-            shape.radius = 34f;
-            shape.radiusThickness = 0.28f;
+            shape.radius = 3.0f;
+            shape.radiusThickness = 1f;
 
+            var colorOverLifetime = stars.colorOverLifetime;
+            colorOverLifetime.enabled = true;
+            colorOverLifetime.color = new ParticleSystem.MinMaxGradient(MakeGradient(
+                new[] { (0f, Color.white), (1f, Color.white) },
+                new[] { (0f, 0f), (0.25f, 1f), (0.75f, 1f), (1f, 0f) }));
+
+            var noise = stars.noise;
+            noise.enabled = true;
+            noise.strength = 0.05f;
+            noise.frequency = 0.15f;
+            noise.scrollSpeed = 0.05f;
+            noise.quality = ParticleSystemNoiseQuality.Low;
+
+            starMaterial = InstantiateTemplate("Additive", "Universal Render Pipeline/Particles/Unlit");
+            starMaterial.name = "星尘材质";
+            starMaterial.SetTexture("_BaseMap", StarSky.CreateSoftSprite(64));
             var renderer = stars.GetComponent<ParticleSystemRenderer>();
-            renderer.material = CreateMaterial("星尘", new Color(0.65f, 0.74f, 1f), 0f, 0f, true);
-            stars.Simulate(60f, true, true, true);
+            renderer.renderMode = ParticleSystemRenderMode.Billboard;
+            renderer.sortMode = ParticleSystemSortMode.None;
+            renderer.shadowCastingMode = ShadowCastingMode.Off;
+            renderer.receiveShadows = false;
+            renderer.material = starMaterial;
+
+            stars.Simulate(30f, true, true, true);
             stars.Play();
         }
 
         private void CreateBreathingOrb()
         {
-            breathingOrb = CreatePrimitive(PrimitiveType.Sphere, "呼吸光核", transform, null).transform;
-            breathingOrb.position = new Vector3(0.72f, -0.12f, 4.4f);
-            breathingOrb.localScale = Vector3.one;
-            orbMaterial = CreateMaterial("呼吸光材质", new Color(0.88f, 0.53f, 0.18f), 0.15f, 0.5f);
-            breathingOrb.GetComponent<Renderer>().material = orbMaterial;
+            breathingOrb = new GameObject("呼吸光核").transform;
+            breathingOrb.SetParent(transform, false);
+            breathingOrb.position = new Vector3(0f, 0.35f, 3.6f);
 
-            ambientKey = breathingOrb.gameObject.AddComponent<Light>();
-            ambientKey.type = LightType.Point;
-            ambientKey.range = 14f;
-            ambientKey.shadows = LightShadows.Soft;
-            ambientKey.intensity = 0.75f;
+            orbCoreMaterial = CreateLit("光核材质", new Color(0.12f, 0.06f, 0.02f), 0f, 0.4f);
+            var core = CreatePrimitive(PrimitiveType.Sphere, "光核", breathingOrb, orbCoreMaterial);
+            core.transform.localScale = Vector3.one * 0.7f;
+
+            orbLight = breathingOrb.gameObject.AddComponent<Light>();
+            orbLight.type = LightType.Point;
+            orbLight.range = 12f;
+            orbLight.shadows = LightShadows.None;
+            orbLight.intensity = 1f;
+
+            haloMaterial = InstantiateTemplate("Additive", "Universal Render Pipeline/Particles/Unlit");
+            haloMaterial.name = "光晕材质";
+            haloMaterial.SetTexture("_BaseMap", StarSky.CreateSoftSprite(128));
+            halo = CreatePrimitive(PrimitiveType.Quad, "光晕", transform, haloMaterial).transform;
+            halo.position = breathingOrb.position;
+            halo.gameObject.layer = GlowLayer;
+        }
+
+        private void CreateReflectionProbe()
+        {
+            var probeObject = new GameObject("环境反射");
+            probeObject.transform.SetParent(transform, false);
+            probeObject.transform.position = DomeCenter + Vector3.up * 1.8f;
+            reflectionProbe = probeObject.AddComponent<ReflectionProbe>();
+            reflectionProbe.mode = ReflectionProbeMode.Realtime;
+            reflectionProbe.refreshMode = ReflectionProbeRefreshMode.ViaScripting;
+            reflectionProbe.timeSlicingMode = ReflectionProbeTimeSlicingMode.AllFacesAtOnce;
+            reflectionProbe.resolution = 256;
+            reflectionProbe.hdr = true;
+            reflectionProbe.size = new Vector3(DomeRadius * 2f + 0.2f, 3.6f, DomeRadius * 2f + 0.2f);
+            reflectionProbe.boxProjection = true;
+            reflectionProbe.cullingMask = ~(1 << GlowLayer);
+            reflectionProbe.nearClipPlane = 0.1f;
+            reflectionProbe.farClipPlane = 60f;
         }
 
         private void CreateAmbientSound()
@@ -241,6 +421,27 @@ namespace SleepHealing.Core
             ambientAudio.Play();
         }
 
+        private LineRenderer CreateLine(string objectName, Vector3[] points, bool loop, float widthStart, float widthEnd, Gradient gradient)
+        {
+            var lineObject = new GameObject(objectName);
+            lineObject.transform.SetParent(transform, false);
+            var line = lineObject.AddComponent<LineRenderer>();
+            line.useWorldSpace = false;
+            line.loop = loop;
+            line.positionCount = points.Length;
+            line.SetPositions(points);
+            line.widthCurve = AnimationCurve.Linear(0f, widthStart, 1f, widthEnd);
+            line.colorGradient = gradient;
+            line.alignment = LineAlignment.View;
+            line.textureMode = LineTextureMode.Stretch;
+            line.numCornerVertices = 2;
+            line.numCapVertices = 3;
+            line.shadowCastingMode = ShadowCastingMode.Off;
+            line.receiveShadows = false;
+            line.sharedMaterial = lineMaterial;
+            return line;
+        }
+
         private static float StageBaseIntensity(ExperienceStage stage)
         {
             return stage switch
@@ -254,6 +455,23 @@ namespace SleepHealing.Core
             };
         }
 
+        private static Gradient MakeGradient((float time, Color color)[] colors, (float time, float alpha)[] alphas)
+        {
+            var colorKeys = new GradientColorKey[colors.Length];
+            for (var index = 0; index < colors.Length; index++)
+            {
+                colorKeys[index] = new GradientColorKey(colors[index].color, colors[index].time);
+            }
+            var alphaKeys = new GradientAlphaKey[alphas.Length];
+            for (var index = 0; index < alphas.Length; index++)
+            {
+                alphaKeys[index] = new GradientAlphaKey(alphas[index].alpha, alphas[index].time);
+            }
+            var gradient = new Gradient();
+            gradient.SetKeys(colorKeys, alphaKeys);
+            return gradient;
+        }
+
         private static GameObject CreatePrimitive(PrimitiveType type, string objectName, Transform parent, Material material)
         {
             var instance = GameObject.CreatePrimitive(type);
@@ -265,21 +483,39 @@ namespace SleepHealing.Core
                 Destroy(collider);
             }
 
+            var renderer = instance.GetComponent<Renderer>();
+            renderer.shadowCastingMode = ShadowCastingMode.Off;
+            renderer.receiveShadows = false;
             if (material != null)
             {
-                instance.GetComponent<Renderer>().material = material;
+                renderer.material = material;
             }
 
             return instance;
         }
 
-        private static Material CreateMaterial(string materialName, Color color, float metallic, float smoothness, bool particle = false)
+        private static Material CreateLit(string materialName, Color baseColor, float metallic, float smoothness)
         {
-            var shader = Shader.Find(particle ? "Particles/Standard Unlit" : "Standard") ?? Shader.Find("Unlit/Color");
-            var material = new Material(shader) { name = materialName, color = color };
-            if (material.HasProperty("_Metallic")) material.SetFloat("_Metallic", metallic);
-            if (material.HasProperty("_Glossiness")) material.SetFloat("_Glossiness", smoothness);
+            var material = InstantiateTemplate("Lit", "Universal Render Pipeline/Lit");
+            material.name = materialName;
+            material.SetColor("_BaseColor", baseColor);
+            material.SetFloat("_Metallic", metallic);
+            material.SetFloat("_Smoothness", smoothness);
+            material.SetColor("_EmissionColor", Color.black);
             return material;
+        }
+
+        // 材质模板由编辑器脚本生成到 Resources，保证 URP 着色器与关键字变体进入打包；缺失时退回 Shader.Find。
+        private static Material InstantiateTemplate(string templateName, string fallbackShader)
+        {
+            var template = Resources.Load<Material>("SleepHealing/" + templateName);
+            if (template != null)
+            {
+                return new Material(template);
+            }
+
+            var shader = Shader.Find(fallbackShader) ?? Shader.Find("Unlit/Color");
+            return new Material(shader);
         }
     }
 }

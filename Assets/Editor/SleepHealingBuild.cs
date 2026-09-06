@@ -1,6 +1,7 @@
 using System;
 using System.IO;
 using System.Linq;
+using System.Reflection;
 using SleepHealing.App;
 using SleepHealing.Core;
 using SleepHealing.EEG;
@@ -15,6 +16,7 @@ using UnityEditor.XR.Management.Metadata;
 using UnityEngine;
 using UnityEngine.EventSystems;
 using UnityEngine.Rendering;
+using UnityEngine.Rendering.Universal;
 using UnityEngine.SceneManagement;
 using UnityEngine.SpatialTracking;
 using UnityEngine.XR.Interaction.Toolkit.UI;
@@ -26,6 +28,10 @@ namespace SleepHealing.Editor
     {
         private const string ScenePath = "Assets/SleepHealing.unity";
         private const string RootName = "睡眠疗愈仓";
+        private const string RenderingFolder = "Assets/Rendering";
+        private const string PipelineAssetPath = RenderingFolder + "/SleepHealingURP.asset";
+        private const string RendererDataPath = RenderingFolder + "/SleepHealingRenderer.asset";
+        private const string MaterialFolder = "Assets/Resources/SleepHealing";
 
         [MenuItem("Sleep Healing/Prepare Scene")]
         public static void PrepareScene()
@@ -111,6 +117,8 @@ namespace SleepHealing.Editor
 
         private static void ConfigureSharedSettings()
         {
+            EnsureRenderPipeline();
+            EnsurePicoDebuggerConfig();
             PlayerSettings.companyName = "GKXN";
             PlayerSettings.productName = "星空深睡";
             PlayerSettings.SetApplicationIdentifier(NamedBuildTarget.Android, "com.gkxn.sleephealing");
@@ -120,6 +128,137 @@ namespace SleepHealing.Editor
             PlayerSettings.fullScreenMode = FullScreenMode.Windowed;
             PlayerSettings.runInBackground = true;
             PlayerSettings.colorSpace = ColorSpace.Linear;
+        }
+
+        [MenuItem("Sleep Healing/Setup Render Pipeline")]
+        public static void SetupRenderPipeline()
+        {
+            Directory.CreateDirectory(RenderingFolder);
+            Directory.CreateDirectory(MaterialFolder);
+            AssetDatabase.Refresh();
+
+            var rendererData = AssetDatabase.LoadAssetAtPath<UniversalRendererData>(RendererDataPath);
+            if (rendererData == null)
+            {
+                rendererData = ScriptableObject.CreateInstance<UniversalRendererData>();
+                AssetDatabase.CreateAsset(rendererData, RendererDataPath);
+            }
+
+            var pipeline = AssetDatabase.LoadAssetAtPath<UniversalRenderPipelineAsset>(PipelineAssetPath);
+            if (pipeline == null)
+            {
+                pipeline = UniversalRenderPipelineAsset.Create(rendererData);
+                AssetDatabase.CreateAsset(pipeline, PipelineAssetPath);
+            }
+
+            // 移动 XR 取向：4x MSAA、HDR 中间缓冲给 Bloom 用、不要深度/不透明拷贝、不要阴影。
+            pipeline.msaaSampleCount = 4;
+            pipeline.supportsHDR = true;
+            pipeline.renderScale = 1f;
+            pipeline.useSRPBatcher = true;
+            pipeline.supportsCameraDepthTexture = false;
+            pipeline.supportsCameraOpaqueTexture = false;
+            pipeline.colorGradingMode = ColorGradingMode.HighDynamicRange;
+            pipeline.colorGradingLutSize = 32;
+            var serialized = new SerializedObject(pipeline);
+            serialized.FindProperty("m_MainLightShadowsSupported").boolValue = false;
+            serialized.FindProperty("m_AdditionalLightShadowsSupported").boolValue = false;
+            serialized.ApplyModifiedPropertiesWithoutUndo();
+            EditorUtility.SetDirty(pipeline);
+
+            GraphicsSettings.defaultRenderPipeline = pipeline;
+            var activeLevel = QualitySettings.GetQualityLevel();
+            for (var index = 0; index < QualitySettings.names.Length; index++)
+            {
+                QualitySettings.SetQualityLevel(index, false);
+                QualitySettings.renderPipeline = pipeline;
+            }
+            QualitySettings.SetQualityLevel(activeLevel, false);
+
+            // URP 17 的全局设置类是 internal，只能反射调用 Ensure 生成 UniversalRenderPipelineGlobalSettings.asset。
+            var globalSettingsType = typeof(UniversalRenderPipelineAsset).Assembly.GetType("UnityEngine.Rendering.Universal.UniversalRenderPipelineGlobalSettings");
+            var ensure = globalSettingsType?.GetMethod("Ensure", BindingFlags.Static | BindingFlags.NonPublic | BindingFlags.Public);
+            if (ensure == null)
+            {
+                throw new InvalidOperationException("UniversalRenderPipelineGlobalSettings.Ensure not found.");
+            }
+            ensure.Invoke(null, new object[] { true });
+
+            CreateMaterialTemplates();
+            AssetDatabase.SaveAssets();
+            Debug.Log("Sleep Healing render pipeline configured.");
+        }
+
+        // PICO SDK 的调试器在开发构建启动时读取 Resources/PXR_PicoDebuggerSO，缺失会抛 NullReference 并弹出开发控制台。
+        private static void EnsurePicoDebuggerConfig()
+        {
+            const string path = "Assets/Resources/PXR_PicoDebuggerSO.asset";
+            if (AssetDatabase.LoadAssetAtPath<Unity.XR.PXR.Debugger.PXR_PicoDebuggerSO>(path) != null)
+            {
+                return;
+            }
+
+            var config = ScriptableObject.CreateInstance<Unity.XR.PXR.Debugger.PXR_PicoDebuggerSO>();
+            config.isOpen = false;
+            AssetDatabase.CreateAsset(config, path);
+            AssetDatabase.SaveAssets();
+        }
+
+        private static void EnsureRenderPipeline()
+        {
+            if (AssetDatabase.LoadAssetAtPath<UniversalRenderPipelineAsset>(PipelineAssetPath) == null
+                || GraphicsSettings.defaultRenderPipeline == null
+                || AssetDatabase.LoadAssetAtPath<Material>(MaterialFolder + "/Skybox.mat") == null)
+            {
+                SetupRenderPipeline();
+            }
+        }
+
+        // 运行时材质全部由代码生成，这些模板只为把 URP 着色器和所需关键字变体带进打包。
+        private static void CreateMaterialTemplates()
+        {
+            var lit = EnsureMaterial("Lit", "Universal Render Pipeline/Lit");
+            lit.EnableKeyword("_EMISSION");
+            lit.SetColor("_EmissionColor", Color.black);
+
+            var additive = EnsureMaterial("Additive", "Universal Render Pipeline/Particles/Unlit");
+            additive.SetFloat("_Surface", 1f);
+            additive.SetFloat("_Blend", 2f);
+            additive.SetFloat("_ZWrite", 0f);
+            additive.SetFloat("_Cull", (float)UnityEngine.Rendering.CullMode.Off);
+            additive.SetFloat("_SrcBlend", (float)UnityEngine.Rendering.BlendMode.SrcAlpha);
+            additive.SetFloat("_DstBlend", (float)UnityEngine.Rendering.BlendMode.One);
+            additive.SetFloat("_SrcBlendAlpha", (float)UnityEngine.Rendering.BlendMode.One);
+            additive.SetFloat("_DstBlendAlpha", (float)UnityEngine.Rendering.BlendMode.One);
+            additive.EnableKeyword("_SURFACE_TYPE_TRANSPARENT");
+            additive.SetOverrideTag("RenderType", "Transparent");
+            additive.renderQueue = (int)UnityEngine.Rendering.RenderQueue.Transparent;
+
+            EnsureMaterial("Skybox", "Skybox/Cubemap");
+        }
+
+        private static Material EnsureMaterial(string materialName, string shaderName)
+        {
+            var shader = Shader.Find(shaderName);
+            if (shader == null)
+            {
+                throw new InvalidOperationException($"Shader missing: {shaderName}");
+            }
+
+            var path = $"{MaterialFolder}/{materialName}.mat";
+            var material = AssetDatabase.LoadAssetAtPath<Material>(path);
+            if (material == null)
+            {
+                material = new Material(shader);
+                AssetDatabase.CreateAsset(material, path);
+            }
+            else
+            {
+                material.shader = shader;
+            }
+
+            EditorUtility.SetDirty(material);
+            return material;
         }
 
         private static void ConfigureAndroid()

@@ -16,6 +16,14 @@
 
 流程依次经过静心准备、基线采集、呼吸放松、深度疗愈和自然唤醒。计时使用不受帧率影响的时间增量，暂停期间不推进阶段。信号质量不足时，场景保留最后一个稳定状态并冻结自适应。
 
+## 渲染与视觉
+
+项目使用 URP 17.5（Unity 6.5 内置）。管线资产在 `Assets/Rendering/`，由 `Sleep Healing/Setup Render Pipeline` 生成；构建入口会自动检查并补齐，不需要手动执行。
+
+视觉全部在运行时生成：`StarSky.cs` 在启动时并行计算一张 HDR 星空立方体贴图（渐变、银河带、幂律亮度恒星），`HealingEnvironment.cs` 生成镜面舱台、十二条穹顶光弧、呼吸光核与近景星尘，并挂一个全局 Volume（Bloom、ACES 色调映射、Vignette、色彩微调）。亮度超过 1.0 的发光体由 Bloom 产生辉光。
+
+`Assets/Resources/SleepHealing/` 里的几个材质只是模板，作用是把 URP 着色器和所需关键字变体带进打包；运行时代码复制模板再改颜色。
+
 ## 真实脑电接入点
 
 `IEEGStateProvider` 是统一数据入口，`SimulatedEEGAdapter` 提供当前模拟数据。拿到改装 PICO 的上位机源码或 SDK 后，在 `PicoEEGAdapter` 内完成协议转换并发布 `EEGState`，场景、状态机和安全逻辑不需要读取厂商原始字段。
@@ -24,7 +32,9 @@
 
 ## 构建与验证
 
-Unity 菜单 `Sleep Healing` 下提供场景准备、macOS 构建和 Android 构建入口。自动化入口为 `SleepHealing.Editor.SleepHealingBuild`。
+Unity 菜单 `Sleep Healing` 下提供场景准备、渲染管线装配、macOS 构建和 Android 构建入口。自动化入口为 `SleepHealing.Editor.SleepHealingBuild`。
+
+`Tools/capture-preview.sh` 一条命令完成 macOS 构建、启动预览版自动截取五阶段画面到 `Artifacts/`、拼成 `Artifacts/五阶段预览.png`，并复制一份带时间戳的副本到桌面（桌面只保留最新一份）。加 `--no-build` 可跳过构建只截图。
 
 Android 构建目前受项目路径限制：Unity 6.5 的 Android 工具拒绝包含非 ASCII 字符的项目绝对路径。把项目放在纯英文路径后即可继续生成 APK；处理方式记录在 `BLOCKED.md`。
 
@@ -34,4 +44,4 @@ Android 构建目前受项目路径限制：Unity 6.5 的 Android 工具拒绝�
 
 ## 未完成的真机验证
 
-PICO 头部追踪、双眼尺度、真机帧率、USB 调试、改装电极佩戴稳定性和真实脑电数据均未验证。真机回来后需要重新检查这些项目，桌面预览不能替代头显验收。
+PICO 头部追踪、双眼尺度、真机帧率、USB 调试、改装电极佩戴稳定性和真实脑电数据均未验证。URP 后处理（Bloom + HDR 中间缓冲 + 4x MSAA）在 XR2 Gen 2 上的帧率也未验证，真机掉帧时优先关 Bloom 或把渲染管线资产的 Render Scale 降到 0.85。真机回来后需要重新检查这些项目，桌面预览不能替代头显验收。

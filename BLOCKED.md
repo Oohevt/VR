@@ -11,4 +11,6 @@
 - PICO 真机不在现场，无法验证头部追踪、双眼视觉、真机帧率、USB 调试和实际佩戴舒适度。
 - 改装 PICO 上位机源码与脑电 SDK 尚未提供，真实字段、协议、采样率和算法含义保持“待 SDK 确认”。
 - Android 构建被 Unity 拒绝：当前项目上级目录含非 ASCII 字符。解决需要把项目放到纯英文路径，或从纯英文路径建立项目链接。
-- Unity 6.5 在自动抓取连续运行画面时存在间歇性 Metal 分块缺失，五张 PNG 均已生成且可辨认阶段和环境变化，但视觉验收应以实际运行的 macOS App 为准。
+- 截图改为 `ScreenCapture` 抓最终画面（含后处理与界面），之前 Camera.Render 到 RenderTexture 的 Metal 分块缺失问题不再出现。
+- PICO SDK 3.4.0 的调试器在开发构建启动时读取 `Resources/PXR_PicoDebuggerSO`，缺失会抛 NullReference 并弹出开发控制台；构建脚本现在自动生成该资产（isOpen=false）。
+- URP 后处理在 PICO 4 Ultra 真机上的帧率未验证。
