@@ -1,0 +1,47 @@
+# Unity generated directories
+[Ll]ibrary/
+[Tt]emp/
+[Oo]bj/
+[Bb]uild/
+[Bb]uilds/
+[Ll]ogs/
+[Uu]ser[Ss]ettings/
+[Mm]emoryCaptures/
+[Rr]ecordings/
+
+# IDE and generated project files
+.idea/
+.vscode/
+.vs/
+*.csproj
+*.sln
+*.suo
+*.tmp
+*.user
+*.userprefs
+*.pidb
+*.booproj
+*.svd
+*.pdb
+*.mdb
+*.opendb
+*.VC.db
+
+# OS metadata
+.DS_Store
+Thumbs.db
+
+# Local validation output containing machine paths
+Artifacts/*.xml
+
+# PICO SDK-generated debugger UI; regenerated locally by the package
+Assets/Resources/PXR_DebuggerPanel.prefab
+Assets/Resources/PXR_DebuggerPanel.prefab.meta
+Assets/Resources/PXR_PICODebugger.prefab
+Assets/Resources/PXR_PICODebugger.prefab.meta
+
+# Signing and package outputs
+*.apk
+*.aab
+*.keystore
+*.jks
